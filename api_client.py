@@ -6,7 +6,8 @@ import time
 
 from openai import AsyncOpenAI
 from core import settings
-
+_ai_cache: dict[tuple[int, str], tuple[float, dict]] = {} # <-- ДОБАВЛЕНО
+CACHE_TTL = 600  # 10 минут в секундах <-- ДОБАВЛЕНО
 client = AsyncOpenAI(api_key=settings.api_token, base_url=settings.api_url)
 
 SYSTEM_PROMPT = """
@@ -70,6 +71,7 @@ SYSTEM_PROMPT = """
 """
 MAX_HISTORY = 12
 
+
 def safe_parse_ai_response(resp_content: str):
     try:
         match = re.search(r'\{.*\}', resp_content, re.DOTALL)
@@ -87,11 +89,24 @@ def safe_parse_ai_response(resp_content: str):
         logging.warning(f"⚠️ Некорректный JSON: {e}, ответ={resp_content[:200]}")
         return {"reply": resp_content, "buttons": []}
 
+
 async def call_ai(user_id: int, history: list[dict]) -> dict:
     if not history:
         history = [{"role": "system", "content": SYSTEM_PROMPT}]
     if len(history) > MAX_HISTORY + 1:
         history = [history[0]] + history[-MAX_HISTORY:]
+
+    # --- Логика кэширования ---
+    now = time.time()
+    # Ключ кэша: ID пользователя + текст его последнего сообщения
+    key = (user_id, history[-1]["content"])
+
+    if key in _ai_cache:
+        ts, cached_data = _ai_cache[key]
+        if now - ts < CACHE_TTL:
+            logging.info(f"💾 Ответ из кэша для user={user_id}")
+            return cached_data
+    # --- Конец логики кэширования ---
 
     retries = 2
     delay = 1
@@ -112,11 +127,16 @@ async def call_ai(user_id: int, history: list[dict]) -> dict:
             logging.info(f"✅ AI ответил за {elapsed:.2f}s (user={user_id})")
             break
         except Exception as e:
-            logging.error(f"❌ Ошибка AI (попытка {attempt+1}): {e}")
+            logging.error(f"❌ Ошибка AI (попытка {attempt + 1}): {e}")
             if attempt < retries:
                 await asyncio.sleep(delay)
                 delay *= 2
             else:
                 return {"reply": "⚠️ Ошибка на стороне AI, попробуйте позже.", "buttons": []}
 
-    return safe_parse_ai_response(resp_content)
+    data = safe_parse_ai_response(resp_content)
+
+    # Сохраняем свежий ответ в кэш
+    _ai_cache[key] = (now, data)  # <-- ДОБАВЛЕНО
+
+    return data

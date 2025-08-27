@@ -1,3 +1,5 @@
+# file: main.py
+
 import asyncio
 import logging
 import sys
@@ -5,25 +7,22 @@ import sys
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.fsm.storage.redis import RedisStorage
-from redis.asyncio.client import Redis
+from aiogram.fsm.storage.memory import MemoryStorage
 
 from core import settings
-from middleware import AntiFloodMiddleware
+from middleware import AntiFloodMiddleware # Убрали setup_database
 from handlers import router
 
 
 async def main():
-    # Инициализация Redis
-    redis_client = Redis(host=settings.redis_host, port=settings.redis_port)
-    storage = RedisStorage(redis=redis_client)
+    # Инициализируем хранилище в памяти для FSM
+    storage = MemoryStorage()
 
     # Инициализация бота и диспетчера
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=storage)
 
-    # Передаем клиент Redis в middleware через workflow_data
-    dp.workflow_data["redis_client"] = redis_client
+    # Регистрируем middleware без параметров
     dp.update.middleware.register(AntiFloodMiddleware())
 
     # Подключаем роутер с хендлерами
@@ -33,7 +32,6 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
-        await redis_client.close()
         await bot.session.close()
 
 

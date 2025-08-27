@@ -1,17 +1,22 @@
+# file: middleware.py
+
 import time
+import logging
 from typing import Callable, Awaitable, Any, Dict
 
 from aiogram import BaseMiddleware
 from aiogram.types import Update, Message
-from redis.asyncio.client import Redis
 
 from core import settings
 
-# === Конфиг ===
+# --- Конфиг ---
 ADMIN_ID = settings.telegram_id
-MIN_INTERVAL = 1.0  # Минимум секунд между сообщениями
-DAILY_LIMIT = 200  # Сообщений в день на пользователя
-COOLDOWN_AFTER_LIMIT = 180  # Секунд блокировки после превышения лимита
+MIN_INTERVAL = 1.0  # минимум секунд между сообщениями
+DAILY_LIMIT = 200  # сколько сообщений в день можно отправить
+COOLDOWN_AFTER_LIMIT = 180  # сколько секунд ждать после превышения лимита
+
+# user_id -> { "last_time": float, "daily_count": int, "day_timestamp": str }
+user_limits: dict[int, dict] = {}
 
 
 class AntiFloodMiddleware(BaseMiddleware):
@@ -29,45 +34,40 @@ class AntiFloodMiddleware(BaseMiddleware):
         if user_id == ADMIN_ID:
             return await handler(event, data)
 
-        redis: Redis = data["redis_client"]
+        now = time.time()
+        today = time.strftime("%Y-%-m-%d")
 
-        # Ключи для Redis
-        key_last_time = f"antiflood:last_time:{user_id}"
-        key_daily_count = f"antiflood:daily_count:{user_id}"
-        key_cooldown = f"antiflood:cooldown:{user_id}"
+        user_stats = user_limits.setdefault(user_id, {
+            "last_time": 0.0,
+            "daily_count": 0,
+            "day_timestamp": "1970-01-01"
+        })
 
-        # 1. Проверка на cooldown
-        if await redis.get(key_cooldown):
-            if isinstance(message, Message):
-                await message.answer("📵 Вы достигли дневного лимита. Попробуйте снова через несколько минут ⏳")
-            return
+        if user_stats["day_timestamp"] != today:
+            user_stats["day_timestamp"] = today
+            user_stats["daily_count"] = 0
 
-        # 2. Проверка минимального интервала
-        last_time = await redis.get(key_last_time)
-        if last_time and time.time() - float(last_time) < MIN_INTERVAL:
+        # 1. Проверка минимального интервала. ЭТО КЛЮЧЕВОЕ ИЗМЕНЕНИЕ.
+        if now - user_stats["last_time"] < MIN_INTERVAL:
             if isinstance(message, Message):
                 await message.answer("⏱ Пожалуйста, не так быстро 🙏")
             return
 
-        await redis.set(key_last_time, time.time(), ex=int(MIN_INTERVAL) + 1)
+        # Сразу обновляем время, чтобы заблокировать следующие быстрые запросы
+        user_stats["last_time"] = now
 
-        # 3. Проверка дневного лимита
-        daily_count_raw = await redis.get(key_daily_count)
-        daily_count = int(daily_count_raw) if daily_count_raw else 0
+        # 2. Проверка дневного лимита
+        if user_stats["daily_count"] >= DAILY_LIMIT:
+            # Используем now, так как last_time уже обновлено
+            if now - user_stats["last_time"] < COOLDOWN_AFTER_LIMIT and user_stats["daily_count"] > DAILY_LIMIT:
+                if isinstance(message, Message):
+                    await message.answer("📵 Вы достигли дневного лимита сообщений. Подождите немного ⏳")
+                return
 
-        if daily_count >= DAILY_LIMIT:
-            await redis.set(key_cooldown, 1, ex=COOLDOWN_AFTER_LIMIT)
-            if isinstance(message, Message):
-                await message.answer("📵 Вы достигли дневного лимита. Попробуйте снова через несколько минут ⏳")
-            return
+        # Вызываем следующий обработчик
+        result = await handler(event, data)
 
-        # Инкремент счетчика и установка TTL до конца дня
-        p = redis.pipeline()
-        p.incr(key_daily_count)
-        if daily_count == 0:
-            # TTL до полуночи
-            seconds_until_midnight = 86400 - (int(time.time()) % 86400)
-            p.expire(key_daily_count, seconds_until_midnight)
-        await p.execute()
+        # Увеличиваем счетчик только после успешной обработки
+        user_stats["daily_count"] += 1
 
-        return await handler(event, data)
+        return result
