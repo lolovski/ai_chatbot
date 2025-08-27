@@ -1,6 +1,7 @@
 import json
 import logging
 import asyncio
+import re
 import time
 
 from async_lru import alru_cache
@@ -40,13 +41,17 @@ SYSTEM_PROMPT = """
 6. CTA → «Оставить заявку», «Получить пример», «Задать вопрос».  
 Всегда веди к кнопку "Оставить заявку" - только такой выход из воронки. Если диалог уходит в сторону — мягко возвращай.
 
-== 4) Формат вывода (СТРОГО) ==
-Возвращай ТОЛЬКО JSON без лишнего текста:
+== 4)  Формат ответа строго: только JSON-объект.  
+Никакого текста вне JSON. Не дублируй сообщение до и после JSON.  
 {
   "reply": "<HTML-текст ответа>",
   "buttons": ["Текст кнопки 1", "Текст кнопки 2", "..."]
 }
-— Поле "buttons" ВСЕГДА присутствует (может быть пустым списком, но лучше 1–4 варианта).
+Правила:
+- "reply" всегда содержит текст для клиента.    
+- Не используй HTML-теги, только переносы строк `\n`.  
+- Никогда не пиши текст вне JSON. Только JSON.
+— Поле "buttons" ВСЕГДА присутствует (может быть пустым списком в крайнем случае, но лучше 1–4 варианта).
 — Никаких других полей не добавляй.
 
 == 5) HTML-правила (Telegram) ==
@@ -100,25 +105,36 @@ SYSTEM_PROMPT = """
 MAX_HISTORY = 12
 
 
-def safe_parse_ai_response(resp: str) -> dict:
-    """Безопасный парсинг ответа от AI"""
+def safe_parse_ai_response(resp):
+    """
+    Безопасный парсер ответа ИИ.
+    - Если JSON найден в тексте → берём только его.
+    - Если нет → делаем fallback {"reply": raw_text, "buttons": []}.
+    """
     try:
+        # Извлечение текста
         if hasattr(resp, "choices"):
             raw_text = resp.choices[0].message.content
         else:
             raw_text = str(resp)
-        data = json.loads(raw_text)
-        if not isinstance(data, dict):
-            raise ValueError("Ответ не dict")
-        if "reply" not in data:
-            data["reply"] = str(raw_text)
-        if "buttons" not in data or not isinstance(data["buttons"], list):
-            data["buttons"] = []
-        return data
-    except Exception as e:
-        logging.warning(f"⚠️ Некорректный JSON: {e}, ответ={raw_text[:200]}")
-        return {"reply": str(raw_text), "buttons": []}
 
+        # Поиск JSON внутри текста
+        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if match:
+            raw_json = match.group(0)
+            data = json.loads(raw_json)
+            if "reply" not in data:
+                data["reply"] = raw_text.strip()
+            if "buttons" not in data or not isinstance(data["buttons"], list):
+                data["buttons"] = []
+            return data
+        else:
+            # Если JSON не найден — возвращаем как текст
+            return {"reply": raw_text.strip(), "buttons": []}
+
+    except Exception as e:
+        logging.warning(f"⚠️ Некорректный JSON: {e}, ответ={str(resp)[:200]}")
+        return {"reply": str(resp), "buttons": []}
 
 async def call_ai(user_id: int, history: list[dict]) -> dict:
     """
