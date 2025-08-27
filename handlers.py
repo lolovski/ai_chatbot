@@ -1,7 +1,8 @@
 import logging
 from aiogram import Router, F, Bot
 from aiogram.filters import CommandStart
-from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
@@ -10,65 +11,123 @@ from core import settings
 
 router = Router()
 
-# Храним историю по user_id
-memory: dict[int, list[dict]] = {}
+
+# Определяем состояния FSM
+class ChatStates(StatesGroup):
+    chatting = State()  # Основное состояние диалога
+    waiting_for_contact = State()  # Состояние ожидания контакта для заявки
 
 
-class UserForm(StatesGroup):
-    waiting_for_contact = State()
-    waiting_for_confirmation = State()
+# --- Вспомогательная функция для отправки ответа от AI ---
+async def send_ai_response(message: Message, text: str, buttons: list):
+    builder = InlineKeyboardBuilder()
+    for button_text in buttons:
+        # Специальный callback_data для кнопки "Оставить заявку"
+        callback_data = "leave_application" if "заявку" in button_text.lower() else button_text
+        builder.add(InlineKeyboardButton(text=button_text, callback_data=callback_data))
 
+    # Располагаем кнопки по одной в строке для лучшей читаемости
+    builder.adjust(1)
+
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+
+
+# --- Хендлеры ---
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
-    memory[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    memory[user_id].append({"role": "assistant", "content": "👋 Привет! Я помогу вам подобрать решение. Хотите узнать больше?"})
+    await state.set_state(ChatStates.chatting)
 
-    kb = ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        keyboard=[[KeyboardButton(text="Да, интересно")]]
-    )
-
-    await message.answer("👋 Привет! Я помогу вам подобрать решение. Хотите узнать больше?", reply_markup=kb)
-
-
-@router.message(F.text == 'Оставить заявку')
-async def form_handler(message: Message, state: FSMContext):
-    await message.answer(
-        '📋 Чтобы оформить заявку, пришлите, пожалуйста, ваш телефон или @username. Мы свяжемся в течение часа.')
-    await state.set_state(UserForm.waiting_for_contact)
-
-
-@router.message(UserForm.waiting_for_contact)
-async def form_data_handler(message: Message, bot: Bot):
-    text = message.text
-    await message.answer(
-        f'Спасибо! Мы получили ваш контакт {text} и скоро свяжемся с вами для уточнения деталей. Если возникнут вопросы — пишите, будем рады помочь!')
-    await bot.send_message(
-        text=f'Пользователь {message.from_user.id} отправил заявку. Контакты: {text}',
-        chat_id=settings.telegram_id
-    )
-
-
-@router.message()
-async def handle_message(message: Message):
-    user_id = message.from_user.id
-
-    if user_id not in memory:
-        memory[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    history = memory[user_id]
-    history.append({"role": "user", "content": message.text})
+    # Инициализируем историю и сразу делаем первый вызов AI для приветствия
+    history = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "/start"}
+    ]
 
     data = await call_ai(user_id, history)
-    reply_text = data.get("reply", "Ошибка ответа")
+    reply_text = data.get("reply", "Здравствуйте! 👋")
     buttons = data.get("buttons", [])
 
-    if buttons:
-        kb = ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[[KeyboardButton(text=b)] for b in buttons])
-        await message.answer(reply_text, reply_markup=kb, parse_mode="HTML")
-    else:
-        await message.answer(reply_text, parse_mode="HTML")
+    history.append({"role": "assistant", "content": reply_text})
+    await state.update_data(history=history)
+
+    await send_ai_response(message, reply_text, buttons)
+
+
+@router.callback_query(F.data == "leave_application")
+async def form_start_handler(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer(
+        '📋 Чтобы оформить заявку, пришлите, пожалуйста, ваш телефон или @username. Мы свяжемся в течение часа.'
+    )
+    await state.set_state(ChatStates.waiting_for_contact)
+    await callback.answer()
+
+
+@router.message(ChatStates.waiting_for_contact)
+async def form_data_handler(message: Message, state: FSMContext, bot: Bot):
+    contact_info = message.text
+    user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
+
+    await message.answer(
+        f'Спасибо! Мы получили ваш контакт «{contact_info}» и скоро свяжемся с вами для уточнения деталей. ✅'
+    )
+    # Отправляем уведомление администратору
+    await bot.send_message(
+        chat_id=settings.telegram_id,
+        text=f"🔔 Новая заявка!\n\nПользователь: {user_info}\nКонтакты: {contact_info}"
+    )
+    # Возвращаем пользователя в основной диалог
+    await state.set_state(ChatStates.chatting)
+
+
+# Обработчик текстовых сообщений от пользователя
+@router.message(ChatStates.chatting)
+async def handle_text_message(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    user_text = message.text
+
+    fsm_data = await state.get_data()
+    history = fsm_data.get("history", [])
+
+    # Безопасная инициализация истории, если она пуста
+    if not history:
+        history = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    history.append({"role": "user", "content": user_text})
+
+    data = await call_ai(user_id, history)
+    reply_text = data.get("reply", "Извините, произошла ошибка.")
+    buttons = data.get("buttons", [])
 
     history.append({"role": "assistant", "content": reply_text})
+    await state.update_data(history=history)
+
+    await send_ai_response(message, reply_text, buttons)
+
+
+# Обработчик нажатий на Inline-кнопки
+@router.callback_query(ChatStates.chatting)
+async def handle_callback_query(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    button_text = callback.data  # Текст кнопки становится "сообщением" пользователя
+
+    # Отвечаем на callback, чтобы убрать "часики"
+    await callback.answer()
+
+    fsm_data = await state.get_data()
+    history = fsm_data.get("history", [])
+
+    if not history:
+        history = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    history.append({"role": "user", "content": button_text})
+
+    data = await call_ai(user_id, history)
+    reply_text = data.get("reply", "Извините, произошла ошибка.")
+    buttons = data.get("buttons", [])
+
+    history.append({"role": "assistant", "content": reply_text})
+    await state.update_data(history=history)
+
+    await send_ai_response(callback.message, reply_text, buttons)
