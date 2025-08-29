@@ -39,7 +39,7 @@ SYSTEM_PROMPT = """
 - **Гибкость:** Любые доработки под бизнес-процессы клиента включены. Нет CRM? Не проблема, Google Sheets — отличное бесплатное решение!
 
 # КАРТА ДИАЛОГА: СТРАТЕГИЯ "ПРЯМОЙ ЛИНИИ" 🗺️
-Твоя задача — провести клиента по прямой линии к продаже. Если он отклоняется — ты элегантно возвращаешь его назад.
+Твоя задача — провести клиента по прямой линии к продаже. Если он отклоняется — ты элегантно возвращаешь его назад, ты можешь вести диалог долго - подводить за 10-20 фраз.
 
 1.  **Мгновенный захват (первые 4 секунды):**
     - Начни с энергии. Никаких долгих приветствий.
@@ -73,11 +73,11 @@ SYSTEM_PROMPT = """
 # ЗОЛОТЫЕ ПРАВИЛА (НЕУКОСНИТЕЛЬНО!)
 
 ### ПРАВИЛО №1: ФОРМАТ ОТВЕТА — ТОЛЬКО JSON!
-Твой ответ **ВСЕГДА** должен быть JSON-объектом.
+Твой ответ **ВСЕГДА** должен быть **ОДИН** JSON-объектом.
 `{ "reply": "<текст>", "buttons": ["Кнопка 1", "Кнопка 2"] }`
 
 ### ПРАВИЛО №2: ДРОБИ ИНФОРМАЦИЮ!
-**НИКОГДА** не пиши длинных сообщений. Вместо одного большого текста отправляй 2-4 коротких, энергичных сообщения подряд. Твоя задача — вести диалог в высоком темпе. Имитируй быструю печать.
+**НИКОГДА** не пиши длинных сообщений. Вместо одного большого текста отправляй 20-40 коротких, энергичных сообщения подряд. Твоя задача — вести диалог в высоком темпе. Имитируй быструю печать.
 
 ### ПРАВИЛО №3: HTML-РАЗМЕТКА TELEGRAM
 - **РАЗРЕШЕНО:** `<b>`, `<i>`, `<u>`. Используй `<b>` для выделения ключевых выгод.
@@ -134,73 +134,99 @@ SYSTEM_PROMPT = """
 Твоя задача — быть лучшим продавцом, которого клиент когда-либо встречал. Действуй! 🚀
 """
 MAX_HISTORY = 50
+AI_TIMEOUT = 5
+MAX_RETRIES = 2
+
+class MalformedJSONError(Exception):
+    """Исключение для случаев, когда AI возвращает невалидный JSON."""
+    pass
 
 
-def safe_parse_ai_response(resp_content: str):
-    try:
-        match = re.search(r'\{.*\}', resp_content, re.DOTALL)
-        if match:
-            raw_json = match.group(0)
-            data = json.loads(raw_json)
-            if "reply" not in data:
-                data["reply"] = resp_content.strip()
-            if "buttons" not in data or not isinstance(data["buttons"], list):
-                data["buttons"] = []
-            return data
-        else:
-            return {"reply": resp_content.strip(), "buttons": []}
-    except Exception as e:
-        logging.warning(f"⚠️ Некорректный JSON: {e}, ответ={resp_content[:200]}")
-        return {"reply": resp_content, "buttons": []}
+def parse_ai_response(resp_content: str) -> dict:
+    """
+    Находит все JSON-объекты, объединяет их и возвращает единый dict.
+    Если JSON не найден или некорректен, вызывает MalformedJSONError.
+    """
+    json_strings = re.findall(r'\{.*?\}', resp_content, re.DOTALL)
+
+    if not json_strings:
+        raise MalformedJSONError(f"В ответе AI не найдено JSON-объектов. Ответ: {resp_content[:200]}")
+
+    parsed_jsons = []
+    for s in json_strings:
+        try:
+            data = json.loads(s)
+            if isinstance(data, dict) and "reply" in data:
+                parsed_jsons.append(data)
+        except json.JSONDecodeError as e:
+            raise MalformedJSONError(f"Ошибка декодирования JSON: {e}. Фрагмент: {s}") from e
+
+    if not parsed_jsons:
+        raise MalformedJSONError(
+            f"Найдены JSON-подобные строки, но ни одна не прошла валидацию. Ответ: {resp_content[:200]}")
+
+    combined_reply = "\n\n".join(j.get("reply", "").strip() for j in parsed_jsons)
+    final_buttons = parsed_jsons[-1].get("buttons", [])
+
+    if not isinstance(final_buttons, list):
+        final_buttons = []
+
+    return {"reply": combined_reply, "buttons": final_buttons}
 
 
+# --- Шаг 3: Перерабатываем основную функцию с циклом ретраев ---
 async def call_ai(user_id: int, history: list[dict]) -> dict:
     if not history:
         history = [{"role": "system", "content": SYSTEM_PROMPT}]
     if len(history) > MAX_HISTORY + 1:
         history = [history[0]] + history[-MAX_HISTORY:]
 
-    # --- Логика кэширования ---
-    now = time.time()
-    # Ключ кэша: ID пользователя + текст его последнего сообщения
-    key = (user_id, history[-1]["content"])
+    # Копируем историю, чтобы не изменять оригинальный объект в FSM до успешного ответа
+    current_history = list(history)
 
-    if key in _ai_cache:
-        ts, cached_data = _ai_cache[key]
-        if now - ts < CACHE_TTL:
-            logging.info(f"💾 Ответ из кэша для user={user_id}")
-            return cached_data
-    # --- Конец логики кэширования ---
-
-    retries = 2
-    delay = 1
-    resp_content = ""
-
-    for attempt in range(retries + 1):
+    for attempt in range(MAX_RETRIES + 1):
         try:
             start = time.perf_counter()
             resp = await asyncio.wait_for(
                 client.chat.completions.create(
                     model=settings.model,
-                    messages=history,
+                    messages=current_history,
                 ),
-                timeout=20
+                timeout=AI_TIMEOUT
             )
             resp_content = resp.choices[0].message.content
             elapsed = time.perf_counter() - start
-            logging.info(f"✅ AI ответил за {elapsed:.2f}s (user={user_id})")
-            break
-        except Exception as e:
-            logging.error(f"❌ Ошибка AI (попытка {attempt + 1}): {e}")
-            if attempt < retries:
-                await asyncio.sleep(delay)
-                delay *= 2
+
+            # Пытаемся распарсить ответ
+            parsed_data = parse_ai_response(resp_content)
+
+            logging.info(f"✅ AI ответил корректным JSON за {elapsed:.2f}s (user={user_id}, попытка {attempt + 1})")
+            return parsed_data
+
+        except MalformedJSONError as e:
+            logging.warning(f"⚠️ Ошибка JSON от AI (попытка {attempt + 1}/{MAX_RETRIES + 1}): {e}")
+            if attempt < MAX_RETRIES:
+                # Готовимся к ретраю: добавляем в историю просьбу исправить ошибку
+                current_history.append({"role": "assistant", "content": resp_content})
+                current_history.append({
+                    "role": "user",
+                    "content": "Your previous response was not a valid JSON. Please correct it and strictly follow the required JSON format. Ensure your entire response is a single, valid JSON object or multiple valid JSON objects."
+                })
+                await asyncio.sleep(1)  # Небольшая задержка перед повторным запросом
+                continue  # Переходим к следующей попытке
             else:
-                return {"reply": "⚠️ Ошибка на стороне AI, попробуйте позже.", "buttons": []}
+                logging.error(f"❌ Не удалось получить корректный JSON после {MAX_RETRIES + 1} попыток от AI.")
+                return {
+                    "reply": "⚠️ Произошла внутренняя ошибка. Пожалуйста, попробуйте повторить ваш запрос чуть позже.",
+                    "buttons": []}
 
-    data = safe_parse_ai_response(resp_content)
+        except Exception as e:
+            logging.error(f"❌ Критическая ошибка при вызове AI (попытка {attempt + 1}): {e}")
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(2 * (attempt + 1))  # Увеличиваем задержку при сетевых ошибках
+                continue
+            else:
+                return {"reply": "⚠️ Сервер AI временно недоступен. Пожалуйста, попробуйте позже.", "buttons": []}
 
-    # Сохраняем свежий ответ в кэш
-    _ai_cache[key] = (now, data)  # <-- ДОБАВЛЕНО
-
-    return data
+    # Этот блок выполнится, только если все попытки в цикле не увенчались успехом
+    return {"reply": "⚠️ Не удалось получить ответ от AI. Пожалуйста, попробуйте позже.", "buttons": []}
